@@ -1,128 +1,161 @@
 #!/bin/bash
 
-# Проверяем, запущен ли скрипт от root
-if [ "$(id -u)" -ne 0 ]; then
-    echo "Скрипт должен быть запущен от имени root."
+# Проверка режима загрузки (EFI или BIOS)
+if [ -d /sys/firmware/efi ]; then
+    echo "Система загружена в режиме EFI."
+    efi_mode=true
+else
+    echo "Система загружена в режиме BIOS."
+    efi_mode=false
+fi
+
+# Вопрос о разметке диска
+read -p "Укажите диск для разметки (например, /dev/sda): " disk
+
+# Уточнение и подтверждение
+echo "Будет произведена полная разметка диска $disk. Все данные будут удалены."
+read -p "Вы уверены? (y/n): " confirm
+if [ "$confirm" != "y" ]; then
+    echo "Установка отменена."
     exit 1
 fi
 
-# Запрашиваем данные
-read -p "Введите имя пользователя: " username
-read -p "Введите имя хоста (например, archlinux): " hostname
-read -p "Введите пароль для пользователя $username: " -s user_password
-echo
-read -p "Введите пароль для root: " -s root_password
-echo
-read -p "Выберите файловую систему для корня (ext4 или btrfs, по умолчанию ext4): " fs_type
-fs_type=${fs_type:-ext4}
-read -p "Введите имя устройства (например, /dev/sda): " device
+# Синхронизация времени
+echo "Синхронизация времени..."
+timedatectl set-ntp true
 
-# Запрашиваем тип системы (BIOS или EFI)
-read -p "Введите тип системы (bios или efi): " system_type
-
-# Запрашиваем размеры разделов
-read -p "Введите размер корневого раздела (например, 20G): " root_size
-read -p "Введите размер раздела для /home (например, 20G, введите 0, если не нужно): " home_size
-read -p "Введите размер подкачки (например, 2G, введите 0, если не нужно): " swap_size
-
-# Подготовка к установке
-echo "Создаем разделы..."
-parted $device mklabel gpt
-
-if [[ "$system_type" == "efi" ]]; then
-    parted -a opt $device mkpart primary fat32 1MiB 1025MiB # EFI раздел
+# Вопрос о размере EFI-раздела (если система EFI)
+if $efi_mode; then
+    read -p "Укажите размер EFI-раздела (например, 512MiB): " efi_size
 fi
 
-parted -a opt $device mkpart primary $fs_type 1025MiB $root_size # Корневой раздел
-if [ "$home_size" -gt 0 ]; then
-    parted -a opt $device mkpart primary $fs_type $((1025 + root_size))MiB $((1025 + root_size + home_size))MiB # /home
-fi
-if [ "$swap_size" -gt 0 ]; then
-    parted -a opt $device mkpart primary linux-swap $((1025 + root_size + home_size))MiB $((1025 + root_size + home_size + swap_size))MiB # Подкачка
-fi
-
-echo "Форматируем и монтируем разделы..."
-if [[ "$system_type" == "efi" ]]; then
-    mkfs.fat -F32 "${device}1" # Форматируем EFI раздел
+# Вопрос о создании раздела подкачки
+read -p "Создать раздел подкачки (swap)? (y/n): " create_swap
+if [ "$create_swap" == "y" ]; then
+    read -p "Укажите размер раздела подкачки (например, 4GiB): " swap_size
+else
+    swap_size="0"
 fi
 
-mkfs."$fs_type" -F "${device}2" # Форматируем корневой раздел
-mount "${device}2" /mnt
-
-if [ "$home_size" -gt 0 ]; then
-    mkfs."$fs_type" -F "${device}3" # Форматируем /home
-    mkdir /mnt/home
-    mount "${device}3" /mnt/home
+# Вопрос о создании дополнительного раздела для данных
+read -p "Создать отдельный раздел для данных? (y/n): " create_data_partition
+if [ "$create_data_partition" == "y" ]; then
+    read -p "Укажите размер раздела для данных (например, 50GiB): " data_size
+else
+    data_size="0"
 fi
 
-if [ "$swap_size" -gt 0 ]; then
-    mkswap "${device}4" # Форматируем подкачку
-    swapon "${device}4"
+# Вопрос о размере корневого раздела
+read -p "Укажите размер корневого раздела (например, 30GiB): " root_size
+
+# Разметка диска
+echo "Разметка диска..."
+parted $disk --script mklabel gpt
+
+if $efi_mode; then
+    parted $disk --script mkpart primary fat32 1MiB $efi_size
+    parted $disk --script set 1 esp on
+    efi_partition="${disk}1"
 fi
 
-# Установка базовой системы
-echo "Устанавливаем базовую систему..."
+# Создание раздела подкачки (если нужно)
+if [ "$swap_size" != "0" ]; then
+    parted $disk --script mkpart primary linux-swap $efi_size $((efi_size + swap_size))
+    swap_partition="${disk}2"
+    echo "Раздел подкачки создан."
+fi
+
+# Создание корневого раздела
+parted $disk --script mkpart primary ext4 $((efi_size + swap_size)) $((efi_size + swap_size + root_size))
+root_partition="${disk}3"
+echo "Корневой раздел создан."
+
+# Создание раздела для данных (если нужно)
+if [ "$data_size" != "0" ]; then
+    parted $disk --script mkpart primary ext4 $((efi_size + swap_size + root_size)) $((efi_size + swap_size + root_size + data_size))
+    data_partition="${disk}4"
+    echo "Раздел для данных создан."
+fi
+
+# Форматирование разделов
+echo "Форматирование разделов..."
+mkfs.ext4 "${root_partition}"
+if [ "$swap_size" != "0" ]; then
+    mkswap "${swap_partition}"
+    swapon "${swap_partition}"
+fi
+
+if $efi_mode; then
+    mkfs.fat -F32 "${efi_partition}"
+fi
+
+if [ "$data_size" != "0" ]; then
+    mkfs.ext4 "${data_partition}"
+fi
+
+# Монтирование разделов
+echo "Монтирование разделов..."
+mount "${root_partition}" /mnt
+
+if $efi_mode; then
+    mkdir /mnt/boot
+    mount "${efi_partition}" /mnt/boot
+fi
+
+if [ "$data_size" != "0" ]; then
+    mkdir /mnt/data
+    mount "${data_partition}" /mnt/data
+fi
+
+# Установка базовых пакетов
+echo "Установка базовой системы..."
 pacstrap /mnt base linux linux-firmware
 
-# Генерация fstab
-echo "Генерируем fstab..."
-genfstab -U /mnt >> /mnt/etc/fstab
+# Установка sudo
+echo "Установка sudo..."
+arch-chroot /mnt pacman -S sudo
 
-# Настройка системы
-arch-chroot /mnt /bin/bash <<EOF
-# Устанавливаем дополнительные пакеты
-pacman -S --noconfirm networkmanager grub amd-ucode efibootmgr
+# Создание пользователя
+read -p "Введите имя пользователя: " username
+arch-chroot /mnt useradd -m -G users -s /bin/bash "$username"
 
-# Настраиваем язык и локализацию
-echo "LANG=en_US.UTF-8" > /etc/locale.conf
-echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
-locale-gen
-echo "$hostname" > /etc/hostname
+# Установка пароля для пользователя
+echo "Установка пароля для пользователя $username:"
+arch-chroot /mnt passwd "$username"
 
-# Настройка сети
-systemctl enable NetworkManager
+# Установка пароля для root
+echo "Установка пароля для root:"
+arch-chroot /mnt passwd root
 
-# Настройка таймзоны
-read -p "Введите вашу таймзону (например, Europe/Moscow): " timezone
-ln -sf /usr/share/zoneinfo/\$timezone /etc/localtime
-hwclock --systohc
+# Вопрос о выборе окружения рабочего стола (DE)
+echo "Выберите окружение рабочего стола (DE):"
+echo "1) GNOME"
+echo "2) KDE"
+echo "3) Xfce"
+read -p "Введите номер выбора (1/2/3): " de_choice
 
-# Установка GRUB
-if [[ "$system_type" == "efi" ]]; then
-    mkdir -p /boot/efi
-    mount "${device}1" /boot/efi
-    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ArchLinux
-else
-    grub-install --target=i386-pc $device
-fi
-
-grub-mkconfig -o /boot/grub/grub.cfg
-
-# Создаем пользователя
-useradd -m -G "$username" "$username"
-echo "$username:$user_password" | chpasswd
-echo "root:$root_password" | chpasswd
-
-# Настройка sudo
-echo "$username ALL=(ALL) ALL" >> /etc/sudoers
-
-# Установка рабочего окружения (например, XFCE)
-read -p "Выберите рабочее окружение (например, xfce, gnome, kde): " desktop_env
-if [[ "$desktop_env" == "xfce" ]]; then
-    pacman -S --noconfirm xfce4 xfce4-goodies lightdm lightdm-gtk-greeter
-    systemctl enable lightdm
-elif [[ "$desktop_env" == "gnome" ]]; then
-    pacman -S --noconfirm gnome gnome-extra
-    systemctl enable gdm
-elif [[ "$desktop_env" == "kde" ]]; then
-    pacman -S --noconfirm plasma sddm
-    systemctl enable sddm
-else
-    echo "Неизвестное рабочее окружение. Установка не выполнена."
-    exit 1
-fi
-
-EOF
+case $de_choice in
+    1)
+        echo "Установка GNOME..."
+        arch-chroot /mnt pacman -S gnome gdm
+        arch-chroot /mnt systemctl enable gdm
+        ;;
+    2)
+        echo "Установка KDE..."
+        arch-chroot /mnt pacman -S plasma sddm
+        arch-chroot /mnt systemctl enable sddm
+        ;;
+    3)
+        echo "Установка Xfce..."
+        arch-chroot /mnt pacman -S xfce4 lightdm lightdm-gtk-greeter
+        arch-chroot /mnt systemctl enable lightdm
+        ;;
+    *)
+        echo "Некорректный выбор, установка DE пропущена."
+        ;;
+esac
 
 # Завершение установки
-echo "Установка завершена. Перезагрузите систему."
+echo "Установка завершена! Выход из chroot и перезагрузка."
+umount -R /mnt
+reboot
